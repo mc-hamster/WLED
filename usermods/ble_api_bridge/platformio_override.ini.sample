@@ -1,0 +1,65 @@
+; Copy to the repository root as platformio_override.ini.
+; These targets include BLE; the ordinary upstream targets do not.
+[ble_api_bridge]
+build_flags =
+  -D CONFIG_BT_NIMBLE_ROLE_CENTRAL_DISABLED
+  -D CONFIG_BT_NIMBLE_ROLE_OBSERVER_DISABLED
+  -D MYNEWT_VAL_BLE_SM_SC_ONLY=1
+
+; 4 MB strip variants reserve 256 KB for presets and omit 2D effects and optional integrations.
+[ble_api_bridge_4mb]
+build_unflags =
+  -D WLED_ENABLE_DMX_INPUT
+  -D WLED_ENABLE_GIF
+build_flags =
+  -D WLED_DISABLE_INFRARED
+  -D WLED_DISABLE_ALEXA
+  -D WLED_DISABLE_HUESYNC
+  -D WLED_DISABLE_ESPNOW
+  -D WLED_DISABLE_2D
+lib_ignore =
+  IRremoteESP8266
+  wled-espnow
+  esp_dmx
+  AnimatedGIF
+  GifDecoder
+
+[env:esp32dev_ble_api_bridge]
+extends = env:esp32dev
+custom_usermods = ble_api_bridge
+build_flags = ${env:esp32dev.build_flags} ${ble_api_bridge.build_flags} ${ble_api_bridge_4mb.build_flags}
+  -D WLED_RELEASE_NAME=\"ESP32_BLE\"
+build_unflags = ${esp32_idf_V5.build_unflags} ${ble_api_bridge_4mb.build_unflags}
+  -D WLED_RELEASE_NAME=\"ESP32\"
+lib_ignore = ${esp32_idf_V5.lib_ignore} ${ble_api_bridge_4mb.lib_ignore}
+board_build.partitions = ${esp32.big_partitions}
+
+[env:esp32c3dev_ble_api_bridge]
+extends = env:esp32c3dev
+custom_usermods = ble_api_bridge
+build_flags = ${env:esp32c3dev.build_flags} ${ble_api_bridge.build_flags} ${ble_api_bridge_4mb.build_flags}
+  -D WLED_RELEASE_NAME=\"ESP32-C3_BLE\"
+build_unflags = ${esp32_idf_V5.build_unflags} ${ble_api_bridge_4mb.build_unflags}
+  -D WLED_RELEASE_NAME=\"ESP32-C3\"
+lib_ignore = ${esp32_idf_V5.lib_ignore} ${ble_api_bridge_4mb.lib_ignore}
+board_build.partitions = ${esp32.big_partitions}
+
+[env:esp32s3dev_ble_api_bridge]
+extends = env:esp32s3dev_8MB_opi
+custom_usermods = ble_api_bridge
+build_flags = ${env:esp32s3dev_8MB_opi.build_flags} ${ble_api_bridge.build_flags}
+  -D WLED_RELEASE_NAME=\"ESP32-S3_8MB_opi_BLE\"
+
+build_unflags = ${esp32_idf_V5.build_unflags}
+  -D WLED_RELEASE_NAME=\"ESP32-S3_8MB_opi\"
+
+; Classic ESP32 with 8 MB flash: retain 2D/GIF and integrations, omit DMX input for IRAM capacity.
+[env:esp32dev_8MB_ble_api_bridge]
+extends = env:esp32dev_8M
+custom_usermods = ble_api_bridge
+build_flags = ${env:esp32dev_8M.build_flags} ${ble_api_bridge.build_flags}
+  -D WLED_RELEASE_NAME=\"ESP32_8M_BLE\"
+build_unflags = ${esp32_idf_V5.build_unflags} -D WLED_ENABLE_DMX_INPUT
+  -D WLED_RELEASE_NAME=\"ESP32_8M\"
+lib_ignore = ${esp32_idf_V5.lib_ignore} esp_dmx
+board_build.flash_mode = dio

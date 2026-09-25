@@ -1,5 +1,16 @@
 {
   "name": "ble_api_bridge",
-  "build": { "libArchive": false },
-  "platforms": ["espressif32"]
+  "build": {
+    "libArchive": false,
+    "srcFilter": [
+      "+<*>",
+      "-<tests/>"
+    ]
+  },
+  "platforms": [
+    "espressif32"
+  ],
+  "dependencies": {
+    "h2zero/NimBLE-Arduino": "2.5.1"
+  }
 }

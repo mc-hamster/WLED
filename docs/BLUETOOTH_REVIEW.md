@@ -1,0 +1,111 @@
+# iOS ↔ WLED Bluetooth review
+
+Reviewed 2026-09-24 on the `ble` branches of `mc-hamster/WLED` and `mc-hamster/WLED-iOS`. This work is maintained as a fork; no pull request, push, device flash, or deployment was performed.
+
+## Baseline and conclusion
+
+Firmware upstream: [`wled/WLED` at `58dfd8ce52e40298cd6991e3d46f328117c7e873`](https://github.com/wled/WLED/commit/58dfd8ce52e40298cd6991e3d46f328117c7e873). App upstream: [`Moustachauve/WLED-iOS` at `16eee4cab5699e398b56c322a45e8354cda8df1b`](https://github.com/Moustachauve/WLED-iOS/commit/16eee4cab5699e398b56c322a45e8354cda8df1b). Both source tips were fetched and merged into the existing BLE branches, retaining their Bluetooth work and upstream app lifecycle/network improvements.
+
+The app and firmware now implement the same service, security handshake, byte framing, write limits, JSON routes, and serialized request lifecycle. Previously the firmware used unavailable IDF 4 NimBLE entry points under the current Arduino 3 stack, and the app had continuation, timer, and readiness races. Those problems are fixed and covered by builds and software tests where practical.
+
+**Physical interoperability is still unverified.** No flashable ESP32 board and available iPhone pair were connected. The locked Mac also prevented manual Simulator screen inspection. Passing builds and simulated callbacks establish software correctness within the tested cases; they do not prove radio coexistence, system pairing UX, or sustained on-device memory stability. Use the acceptance matrix below before distributing firmware.
+
+## Findings and changes
+
+| Priority | Original problem and impact | Resolution / evidence |
+| --- | --- | --- |
+| P0 | Raw `esp_nimble_hci_and_controller_init` and host APIs did not match the selected Arduino 3 / IDF 5 toolchain; effect-data serialization also referenced a missing function. | Explicit NimBLE-Arduino 2.5.1 dependency and public 2.x API; `/json/fxdata` uses WLED's actual mode metadata. Firmware build matrix verifies linkage. |
+| P1 | Every device used `123456`; the app displayed security options that could not configure iOS pairing; numeric comparison was automatically accepted. | Persistent random per-installation passkey, protected pairing probe, authenticated encrypted characteristics, bonding and mandatory SC-only compile setting. Code changes revoke bonds. iOS owns the prompt; obsolete app secrets are cleared. |
+| P1 | NimBLE callbacks and WLED's loop shared mutable strings, assemblies, and response state without synchronization. Runtime settings could resize buffers during writes. | Fixed-size event queue transfers host events to the loop. Only the loop owns request/response memory and invokes WLED. Atomic status fields and a bounded mutex protect configuration snapshots; request buffer stays fixed at 4096 bytes. |
+| P1 | Requests arriving during live updates were discarded; response offsets advanced without confirmed delivery. Errors could be mistaken for the next request's reply. | One indication scheduler, confirmation of every packet including the last, separate pending request assembly, and commands prioritized over live updates. Ambiguous framing or transport failure disconnects before retry. |
+| P1 | NimBLE 2.5.1's new `onStatus` overload passes a zero-initialized connection-info object. Assuming it identifies the peer can discard indication acknowledgements. | Adapter captures the accepted peer's real handle in ordered connect/disconnect callbacks. Exactly one peer is accepted even when a chip SDK reserves multiple slots. See [NimBLEServer.cpp](https://github.com/h2zero/NimBLE-Arduino/blob/2.5.1/src/NimBLEServer.cpp), `BLE_GAP_EVENT_NOTIFY_TX`. |
+| P1 | Core Bluetooth's with-response write limit could produce a long write larger than the firmware's ATT chunk. Framing was not strict about truncation and overflow. | Write budget is the smaller Core Bluetooth limit, capped at 244; strict byte-count assemblers reject invalid frames. UTF-8 bodies remain bytes until full reassembly. Cross-language UUID checks and packet-boundary tests pass. |
+| P1 | Cancelled timeout tasks continued, simultaneous connects/requests could replace continuations, and a response could complete before the last write acknowledgement. | Main-actor session claims a request slot before suspension, owns all continuations, checks cancellation in timers, and waits for both complete response and final write acknowledgement. Tests cover cancellation, concurrent readiness, response/write ordering, timeouts, and recovery. |
+| P1 | Disconnects could leave the app showing connected; stale asynchronous work could revive a destroyed client; writes could overlap. | Immediate disconnect propagation, generation-guarded tasks, exponential reconnect, independent state-change coalescing, and one serialized command stream. Pairing/permission errors wait for explicit user action. |
+| P1 | BLE metadata was added directly to the already-shipped Core Data v2 model, endangering upstream store migration. | Restored upstream v2 and made the BLE schema v3; migration flags are set before loading. An actual v2 SQLite store migrates with names, MACs, and Wi-Fi addresses preserved. Former BLE v2's schema remains represented by v3. |
+| P1 | An unrelated HTTP client's global `correctPIN` could authorize a BLE configuration write. | `/json/cfg` writes independently validate the PIN in that request. Protected reads require the PIN-protected Wi-Fi settings path. No global unlock is borrowed or changed. |
+| P1 | Larger dependencies overflowed 4 MB flash slots; classic ESP32's complete integration set overflowed instruction RAM even with 8 MB flash. | Explicit compact ESP32/C3 profiles, larger 4 MB slots, an 8 MB ESP32 profile without DMX input, and an S3 8 MB octal-PSRAM profile. All profile differences and partition migration requirements are documented. |
+| P2 | BLE device UUIDs were stored as hostnames; mDNS address changes could unnecessarily restart BLE connections. | UUIDs are excluded from Wi-Fi addresses; BLE connection signatures depend on the peripheral identity. Existing Wi-Fi addresses survive BLE registration. |
+| P2 | Discovery lost scan intent while the radio initialized; early construction could prompt for permissions unexpectedly; pairing screens showed ineffective passkey controls. | Lazy central creation, remembered scan intent, explicit permission/radio states, clearer nearby names/signal labels, cancellable onboarding, and system-pairing guidance. Manual visual verification remains pending. |
+| P2 | Bluetooth detail view did not expose useful native LED controls. | Native power, brightness, and main-segment RGB control preserving the white channel; authoritative state refresh after each write and optional live updates. Offline controls are disabled and reconnect/errors are visible. |
+| P2 | Selecting another peripheral could silently associate it with the wrong saved light; stock OTA updates could remove BLE support. | Verify the selected light's MAC before replacing its identifier; cancel verification when leaving. Capability-aware stock update suppression protects BLE-enabled firmware. |
+| P2 | Disabled-at-boot firmware could not enable Bluetooth later; advertising retry timestamps failed after long uptime; oversized names could break advertising. | Runtime start/stop/reconfigure, wrap-safe deadlines, bounded UTF-8 names with unique default suffix, and service UUID in advertising/name in scan response. Abandoned unauthenticated connections expire after 120 seconds. Configuration serialization preserves a newly requested code even if saving precedes its deferred application. |
+
+## Dependency audit
+
+Versions were checked against package registries and upstream release/branch metadata. Exact locks/pins retain reproducibility; “latest” here means current stable versions compatible with this fork's active BLE build, not floating dependency heads on every build.
+
+| Dependency | Selected version / revision | Treatment |
+| --- | --- | --- |
+| [PlatformIO Core](https://pypi.org/project/platformio/) | 6.2.0 | Updated requirements and complete Python lock |
+| [pioarduino ESP32 platform](https://github.com/pioarduino/platform-espressif32/releases/tag/55.03.312-1) | 55.03.312-1 | Arduino 3.3.12 / IDF 5.5.5, replacing the older Tasmota baseline |
+| [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino/releases/tag/2.5.1) | 2.5.1 | Explicit bridge dependency; API and acknowledgement callback source reviewed |
+| [AsyncTCP](https://github.com/ESP32Async/AsyncTCP/releases) | 3.5.0 | Updated |
+| [AnimatedGIF](https://github.com/bitbank2/AnimatedGIF/releases) | 2.2.0 | Updated; enabled in the larger profiles |
+| [ESPAsyncWebServer WLED fork](https://github.com/Aircoookie/ESPAsyncWebServer/commit/dbb7c33898902de66bb165060767f14ae4fb1cca) | 2.4.2, `dbb7c338…` | Updated to this fork's tip; retains WLED-specific APIs |
+| [NeoPixelBus CORE3](https://github.com/Makuna/NeoPixelBus/tree/CORE3) | 2.9.0 branch, `76afe832…` | Already at the compatible branch tip; kept exact pin |
+| [esp_dmx IDF 5 fork](https://github.com/netmindz/esp_dmx/tree/esp-idf-v5-fixes) | 4.1.0, `ed12a290…` | Already at the required fork tip; enabled in S3 profile |
+| [GifDecoder fork](https://github.com/Aircoookie/GifDecoder) | 1.1.0, `bc3af189…` | Already at fork tip |
+| IRremoteESP8266 / AsyncMqttClient | 2.9.0 / 0.9.0 | Latest releases already selected |
+| [Swift Collections](https://github.com/apple/swift-collections/releases) | 1.7.0 | Updated minimum and resolved pin |
+| [SwiftLintPlugins](https://github.com/SimplyDanny/SwiftLintPlugins/releases) | 0.65.1 | Updated minimum and resolved pin |
+| [MarkdownUI](https://github.com/gonzalezreal/swift-markdown-ui/releases) | 2.4.1 | Current release; raised minimum to match |
+| NetworkImage / swift-cmark | 6.0.1 / 0.9.0 | Re-resolved transitive graph to current versions |
+| clean-css / html-minifier-terser | 5.3.3 / 7.2.0 | Current stable, exact npm pins |
+| nodemon / web-resource-inliner | 3.1.14 / 8.0.0 | Updated, npm lock regenerated; npm audit reported zero vulnerabilities |
+| [Bleak](https://pypi.org/project/bleak/) | 3.0.2 | Reference client updated and tested against current API |
+
+Compatibility exceptions are intentional and visible:
+
+- PlatformIO 6.2.0 requires `chardet<6` on Apple Silicon macOS. The lock uses 5.2.0 rather than incompatible 7.6.0. All other packages in the Python lock matched the current PyPI versions during this audit.
+- WLED's vendored ArduinoJson 6.18.1, Time/Timezone, Espalexa, and FastLED subset are customized source, not ordinary resolved packages. They remain as supplied by the fetched WLED tip. Replacing them with generic latest releases (including ArduinoJson 7) is a separate API/memory migration and is **not claimed complete** here.
+- Generic ESP32Async WebServer releases do not replace WLED's specialized fork automatically. Its latest commit changes low-memory admission behavior; runtime heap-stress verification is still required.
+- Optional usermods outside these profiles, ESP8266 compatibility toolchains, and older IDF 4 board profiles retain upstream pins. They were not mass-upgraded or certified by this BLE review.
+
+## Verification performed
+
+- WLED web build: `npm ci`, `npm run build`, and all 16 Node tests passed; no generated headers were committed.
+- Firmware frame assembly: 24,576 native round trips covering every request size 1–4096 at packet budgets 3/20/65/180/182/244; invalid lengths, overflow canaries, overlapping requests, and `millis()` rollover. Clang AddressSanitizer and UndefinedBehaviorSanitizer passed.
+- Python reference client: 8 tests passed for strict framing, UTF-8, concurrent request serialization, ATT budgeting, response-before-write completion, cancellation, timeout/reconnect, malformed packets, required pairing probe, and firmware UUID agreement.
+- iOS: 41 tests passed (46 executions including parameterized ATT cases) on the iOS 27 Simulator using Xcode 27. Tests cover the above session/client races, live/response separation, database migration and legacy secret cleanup, plus upstream regression tests. The deployment target remains iOS 16; older physical OS versions were not exercised.
+- Unsigned generic iPhone build passed. This checks compilation/linkage for devices; it does not install or exercise Core Bluetooth radio traffic.
+- Service/RX/TX/LIVE UUIDs were compared across Swift, C++, and Python and match exactly, ignoring UUID letter case.
+- Final firmware builds passed for all five targets below. RAM figures describe static allocation, not runtime free heap.
+
+| Environment | Result | App flash / slot bytes | Spare app bytes | Static RAM bytes |
+| --- | --- | --- | --- | --- |
+| `esp32dev` | Passed | 1,797,837 / 1,900,544 | 102,707 | 93,632 |
+| `esp32dev_ble_api_bridge` | Passed | 1,821,121 / 1,900,544 | 79,423 | 99,860 |
+| `esp32c3dev_ble_api_bridge` | Passed | 1,847,253 / 1,900,544 | 53,291 | 84,952 |
+| `esp32s3dev_ble_api_bridge` | Passed | 1,905,166 / 2,097,152 | 191,986 | 66,476 |
+| `esp32dev_8MB_ble_api_bridge` | Passed | 1,971,597 / 2,097,152 | 125,555 | 102,252 |
+
+The compact profiles retain roughly 53–79 KB of app-slot headroom. Runtime heap and instruction-RAM pressure still require the hardware soak test; an 8 MB flash chip does not change classic ESP32 RAM capacity.
+
+## Physical-device acceptance matrix (pending)
+
+Record chip, board, flash/PSRAM size, firmware SHA, app SHA, iOS version, free/minimum/largest heap, and negotiated MTU for each run. Use the matching [build profile and setup instructions](../usermods/ble_api_bridge/README.md).
+
+| Scenario | Acceptance condition |
+| --- | --- |
+| Fresh phone / fresh firmware | Device is discoverable by name; one system pairing flow accepts its unique code; app saves identity only after valid JSON; power/brightness/color work. |
+| Wrong code / cancel / app dismissal | Helpful error or clean cancellation; no repeated automatic pairing prompts; an explicit retry succeeds. |
+| Permission denied / Bluetooth off | Clear recovery guidance; permission/radio restoration and rescan/reconnect work; no endless loading. |
+| Repeat launch / phone reboot / firmware reboot | Existing bond reconnects without entering the code again and displays authoritative state. |
+| Bond forgotten on either side / pairing code changed / full NVS erase | Recoverable stale-bond guidance; no silent weakening of authentication; new code pairs after reset. |
+| Two similar names / two phones / reference client connected | Correct identity remains associated with each saved light; duplicate names are distinguishable; only one active client is accepted. |
+| MTU 23, 185, 247; large GET `/json` and `/json/fxdata` | Byte-perfect complete messages; one confirmation per indication; no truncation, timer collisions, or mixed live/response frames. |
+| Rapid color/brightness changes with simultaneous Wi-Fi edits | Latest independent controls arrive, live changes appear, no stale responses or disconnected-but-online state. |
+| Out of range / power loss during write or response | Pending operations terminate; restored connection starts with clean framing and correct status. |
+| Brief app switch / long background / lock/unlock | Upstream grace period behaves; longer background releases link; foreground reconnects. Background continuous control is not promised. |
+| Runtime enable/disable / name change / long UTF-8 name | Advertising follows configuration; disable drops connection; re-enable needs no reboot. |
+| Settings PIN + another Wi-Fi client's unlocked session | Wrong/missing BLE PIN still returns 401; correct PIN authorizes only the submitted configuration write. |
+| Wi-Fi load + BLE + active effects, sustained soak | No watchdog/reset/heap degradation; acceptable control latency and LED output. S3 test should include PSRAM, DMX/GIF and selected integrations. |
+| USB partition transition, backup/restore, subsequent Wi-Fi OTA | Correct app slots and filesystem; settings/presets restored; OTA installs another matching BLE image. |
+| Small screen / large Dynamic Type / VoiceOver / light and dark appearance | Pairing instructions, errors, action buttons, and native controls remain readable and operable. |
+
+Native BLE controls currently cover power, brightness, and the main segment's RGB color while preserving its white component. Preset/effect editors, filesystem/configuration pages, LED streaming, and firmware updates are not native BLE app features; use Wi-Fi for those interfaces. JSON clients can invoke the supported bridge routes directly. Live updates are intended for foreground use, not real-time pixel streaming.
+
+## Local environment notes
+
+A malformed duplicate Git ref that blocked fetching was preserved at `.git/ref-backups/main-2`. A stale BLE dependency cache that stalled package replacement was preserved at `.pio/cache-backup/esp32dev_ble_api_bridge-20260924`. Validation used fresh generated build/dependency directories under `/tmp`; the checked-in sample remains portable. Reviewed application and factory binaries are copied under ignored `build_output/ble-reviewed/`, with SHA-256 hashes in its manifest. These are test builds, not hardware-certified releases.
