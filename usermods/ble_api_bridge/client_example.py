@@ -114,6 +114,8 @@ class BleApiBridgeClient:
         self._generation = 0
         self._ready = False
         self._subscribed = False
+        self._live_receiver_ready = False
+        self._delivery_generation = 0
         self._rx = None
         self._response: asyncio.Future[BridgeResponse] | None = None
         self._tx_frame = FrameAssembler()
@@ -170,54 +172,72 @@ class BleApiBridgeClient:
         return characteristic
 
     async def connect(self, pair: bool = False, *, live: bool = False) -> None:
-        """Bound the connection sequence; the stock macOS protected read also has a 20s limit."""
+        """Arm both streams before commands; optionally request the initial LIVE snapshot."""
         async with self._lifecycle_lock:
-            if self.is_connected:
-                if live:
-                    await self._subscribe_live()
-                return
-            await self._close(suppress_errors=False)
-            self._generation += 1
+            await self._connect_setup(pair)
             generation = self._generation
-            self.client = self._make_client()
-            self._live_error = None
-            self.max_request_bytes = 4096
-            phase = "connection"
-            try:
-                async with asyncio.timeout(self.connect_timeout):
-                    await self.client.connect()
-                    if pair and sys.platform != "darwin":
-                        await self.client.pair()
-                    self._rx = self._characteristic(RX_UUID, {"write"})
-                    self._characteristic(TX_UUID, {"read", "indicate"})
-                    self._characteristic(LIVE_UUID, {"read", "indicate"})
-                    # macOS owns pairing; reading this protected value presents its prompt.
-                    phase = "pairing probe"
-                    if await self.client.read_gatt_char(TX_UUID) != b"ready":
-                        raise ValueError("not a compatible WLED Bluetooth bridge")
-                    phase = "TX subscription"
-                    await self.client.start_notify(TX_UUID, lambda char, data: self._on_tx(char, data, generation))
-                    self._ready = True
-                    if live:
-                        await self._subscribe_live()
-            except TimeoutError as error:
-                await self._close(suppress_errors=True)
-                if phase == "pairing probe" and sys.platform == "darwin":
-                    detail = ("The commissioning probe allows up to 90 seconds within the total connection deadline."
-                              if self.commission else
-                              "Stock Bleak 3.0.2 limits this macOS read to 20 seconds, even with a longer connect_timeout. "
-                              "Use --commission for a manual pairing window of up to 90 seconds.")
-                    raise PairingProbeTimeout("Protected WLED pairing probe timed out. Complete the macOS pairing prompt "
-                                              "using the device code, then retry explicitly. " + detail) from error
-                raise
-            except BaseException:
-                await self._close(suppress_errors=True)
-                raise
+            if live:
+                self._subscribed = True
+        # Requests can close a failed connection, which takes the lifecycle lock.
+        # Keep this read-only readiness handshake outside that lock.
+        if live:
+            await self._live_handshake(generation)
+
+    async def _connect_setup(self, pair: bool) -> None:
+        """Install physical receivers under the caller's lifecycle lock, without writing RX."""
+        if self.is_connected:
+            return
+        await self._close(suppress_errors=False)
+        self._generation += 1
+        generation = self._generation
+        self.client = self._make_client()
+        self._live_error = None
+        self.max_request_bytes = 4096
+        phase = "connection"
+        try:
+            async with asyncio.timeout(self.connect_timeout):
+                await self.client.connect()
+                if pair and sys.platform != "darwin":
+                    await self.client.pair()
+                self._rx = self._characteristic(RX_UUID, {"write"})
+                self._characteristic(TX_UUID, {"read", "indicate"})
+                self._characteristic(LIVE_UUID, {"read", "indicate"})
+                # macOS owns pairing; reading this protected value presents its prompt.
+                phase = "pairing probe"
+                if await self.client.read_gatt_char(TX_UUID) != b"ready":
+                    raise ValueError("not a compatible WLED Bluetooth bridge")
+                phase = "TX subscription"
+                await self.client.start_notify(TX_UUID, lambda char, data: self._on_tx(char, data, generation))
+                phase = "LIVE subscription"
+                if await self.client.read_gatt_char(LIVE_UUID) != b"live":
+                    raise ValueError("invalid WLED LIVE probe")
+                # Firmware gates LIVE until the first complete authenticated RX request.
+                # A later local subscribe must never attach halfway through a wire frame.
+                self._live_receiver_ready = True
+                await self.client.start_notify(LIVE_UUID, lambda char, data: self._on_live(char, data, generation))
+                if generation != self._generation or not self.client.is_connected or self._live_error is not None:
+                    raise self._live_error or ConnectionError("WLED disconnected during setup")
+                self._ready = True
+        except TimeoutError as error:
+            await self._close(suppress_errors=True)
+            if phase == "pairing probe" and sys.platform == "darwin":
+                detail = ("The commissioning probe allows up to 90 seconds within the total connection deadline."
+                          if self.commission else
+                          "Stock Bleak 3.0.2 limits this macOS read to 20 seconds, even with a longer connect_timeout. "
+                          "Use --commission for a manual pairing window of up to 90 seconds.")
+                raise PairingProbeTimeout("Protected WLED pairing probe timed out. Complete the macOS pairing prompt "
+                                          "using the device code, then retry explicitly. " + detail) from error
+            raise
+        except BaseException:
+            await self._close(suppress_errors=True)
+            raise
 
     def _invalidate(self, error: BaseException) -> None:
         """Wake command/live consumers immediately, independently of platform cleanup."""
         self._ready = False
         self._subscribed = False
+        self._live_receiver_ready = False
+        self._delivery_generation += 1
         self._rx = None
         self._tx_frame.reset()
         self._live_frame.reset()
@@ -278,43 +298,37 @@ class BleApiBridgeClient:
 
         self._abort_task = asyncio.create_task(abort())
 
-    async def _subscribe_live(self) -> None:
-        if self._subscribed:
-            return
-        if not self.is_connected:
-            raise ConnectionError("WLED is not ready")
-        generation = self._generation
+    async def _live_handshake(self, generation: int) -> None:
+        """Open firmware's readiness gate after receivers exist, without lock inversion."""
         try:
-            async with asyncio.timeout(self.connect_timeout):
-                if await self.client.read_gatt_char(LIVE_UUID) != b"live":
-                    raise ValueError("invalid WLED LIVE probe")
-                self._live_frame.reset()
-                self._subscribed = True
-                await self.client.start_notify(LIVE_UUID, lambda char, data: self._on_live(char, data, generation))
-        except BaseException:
-            await self._close(suppress_errors=True)
+            if generation != self._generation or not self.is_connected:
+                raise ConnectionError("WLED disconnected before LIVE readiness handshake")
+            await self.refresh_capabilities(_expected_generation=generation)
+            if generation != self._generation or not self.is_connected:
+                raise ConnectionError("WLED disconnected during LIVE readiness handshake")
+        except (ValueError, BridgeHTTPError):
+            # request() already quarantines failures after taking its command slot.
+            # Do not close another caller's active command if this handshake timed
+            # out or was cancelled while queued. Capability validation is ours.
+            async with self._lifecycle_lock:
+                if generation == self._generation:
+                    await self._close(suppress_errors=True)
             raise
 
     async def subscribe_live(self) -> None:
-        """Subscribe once; LIVE contains raw state/info JSON, not a TX status envelope."""
+        """Enable delivery; re-enabling waits for a future update, not a synthetic snapshot."""
         async with self._lifecycle_lock:
-            await self._subscribe_live()
+            if not self.is_connected or not self._live_receiver_ready:
+                raise ConnectionError("WLED is not ready")
+            self._subscribed = True
+            generation = self._generation
+        await self._live_handshake(generation)
 
     async def unsubscribe_live(self) -> None:
-        """Stop live delivery and wake consumers waiting for updates."""
+        """Stop local delivery while retaining wire framing and its stall watchdog."""
         async with self._lifecycle_lock:
-            if self._subscribed and self.is_connected:
-                try:
-                    async with asyncio.timeout(self.disconnect_timeout):
-                        await self.client.stop_notify(LIVE_UUID)
-                except BaseException:
-                    await self._close(suppress_errors=True)
-                    raise
             self._subscribed = False
-            self._live_frame.reset()
-            if self._live_timer is not None:
-                self._live_timer.cancel()
-                self._live_timer = None
+            self._delivery_generation += 1
             while not self._live_queue.empty():
                 self._live_queue.get_nowait()
             self._live_event.set()
@@ -322,7 +336,7 @@ class BleApiBridgeClient:
     def _on_live(self, _characteristic, data: bytearray, generation: int | None = None) -> None:
         if generation is not None and generation != self._generation:
             return
-        if not self._subscribed:
+        if not self._live_receiver_ready:
             return
         try:
             payload = self._live_frame.append(data)
@@ -336,6 +350,8 @@ class BleApiBridgeClient:
             update = json.loads(payload.decode("utf-8"))
             if not isinstance(update, dict) or not isinstance(update.get("state"), dict) or not isinstance(update.get("info"), dict):
                 raise ValueError("LIVE update must contain state and info objects")
+            if not self._subscribed:
+                return
             if self._live_queue.full():
                 self._live_queue.get_nowait()
                 self.live_dropped += 1
@@ -346,18 +362,20 @@ class BleApiBridgeClient:
 
     async def next_live(self, timeout: float | None = None) -> dict:
         """Wait for the next complete update; disconnect and unsubscribe wake waiters."""
+        delivery_generation = self._delivery_generation
         async with asyncio.timeout(self.timeout if timeout is None else timeout):
             while True:
                 if self._live_error is not None:
                     raise self._live_error
-                if not self._subscribed:
+                if not self._subscribed or delivery_generation != self._delivery_generation:
                     raise ConnectionError("LIVE is not subscribed")
                 if not self._live_queue.empty():
                     return self._live_queue.get_nowait()
                 self._live_event.clear()
                 await self._live_event.wait()
 
-    async def request(self, method: str, path: str, body: str = "") -> BridgeResponse:
+    async def request(self, method: str, path: str, body: str = "", *,
+                      _expected_generation: int | None = None) -> BridgeResponse:
         """Send one command; never automatically repeat a possibly applied state write."""
         if not method or any(char.isspace() for char in method) or not path or any(char in path for char in "\r\n\0"):
             raise ValueError("invalid request method or path")
@@ -367,8 +385,13 @@ class BleApiBridgeClient:
         # Waiting callers can time out without disconnecting the caller holding the lock.
         async with asyncio.timeout(self.timeout):
             async with self._request_lock:
+                if _expected_generation is not None and _expected_generation != self._generation:
+                    raise ConnectionError("WLED disconnected before LIVE readiness handshake")
                 if not self.is_connected:
                     raise ConnectionError("WLED is not ready; connect before requesting")
+                # A preceding capabilities request can lower this limit while we wait.
+                if len(payload) > self.max_request_bytes:
+                    raise ValueError(f"request exceeds bridge limit ({self.max_request_bytes} bytes)")
                 budget = self.write_budget
                 characteristic = self._rx
                 generation = self._generation
@@ -381,7 +404,10 @@ class BleApiBridgeClient:
                         await self.client.write_gatt_char(characteristic, framed[offset:offset + budget], response=True)
                         if response.done() and (response.cancelled() or response.exception() is not None):
                             return await response
-                    return await response
+                    result = await response
+                    if generation != self._generation or not self.is_connected:
+                        raise ConnectionError("WLED disconnected before response delivery")
+                    return result
                 except BaseException:
                     # Protocol 1 has no request IDs. Quarantine any unfinished response before reuse.
                     if not response.done():
@@ -411,15 +437,20 @@ class BleApiBridgeClient:
             raise BridgeHTTPError(response)
         return response.json()
 
-    async def refresh_capabilities(self) -> dict:
+    async def refresh_capabilities(self, *, _expected_generation: int | None = None) -> dict:
         """Check protocol/version information and adopt the device's configured request limit."""
-        info = await self.get_json("/json/info")
+        response = await self.request("GET", "/json/info", _expected_generation=_expected_generation)
+        if not 200 <= response.status < 300:
+            raise BridgeHTTPError(response)
+        info = response.json()
         capabilities = info.get("ble") if isinstance(info, dict) else None
         if not isinstance(capabilities, dict) or capabilities.get("protocol") != 1:
             raise ValueError("unsupported WLED BLE protocol")
         limit = capabilities.get("maxRequest")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 256 <= limit <= 4096:
             raise ValueError("invalid WLED request limit")
+        if _expected_generation is not None and _expected_generation != self._generation:
+            raise ConnectionError("WLED disconnected during LIVE readiness handshake")
         self.max_request_bytes = limit
         return info
 

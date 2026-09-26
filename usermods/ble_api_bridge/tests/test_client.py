@@ -32,6 +32,7 @@ class FakePeripheral:
         self.services = self
         self.disconnected_callback = disconnected_callback
         self.callbacks = {}
+        self.events = []
         self.requests = []
         self.writes = []
         self.pending = bytearray()
@@ -41,7 +42,7 @@ class FakePeripheral:
         self.probe = b"ready"
         self.disconnect_stalls = False
         self.disconnect_error = None
-        self.response_body = '200 application/json\n\n{"name":"Lumière 🌈"}\n\n'.encode()
+        self.response_body = b'200 application/json\n\n{"ble":{"protocol":1,"maxRequest":4096}}'
         self.characteristics = {
             bridge.RX_UUID: FakeCharacteristic(bridge.RX_UUID, ["write"]),
             bridge.TX_UUID: FakeCharacteristic(bridge.TX_UUID, ["read", "indicate"]),
@@ -63,9 +64,11 @@ class FakePeripheral:
         return self.probe if uuid == bridge.TX_UUID else b"live"
 
     async def start_notify(self, uuid, callback):
+        self.events.append(("notify", uuid))
         self.callbacks[uuid] = callback
 
     async def stop_notify(self, uuid):
+        self.events.append(("stop_notify", uuid))
         self.callbacks.pop(uuid, None)
 
     def get_characteristic(self, uuid):
@@ -80,6 +83,7 @@ class FakePeripheral:
     async def write_gatt_char(self, characteristic, data, *, response):
         assert self.is_connected and characteristic.uuid == bridge.RX_UUID and response and len(data) <= 20
         self.writes.append(data)
+        self.events.append(("write", characteristic.uuid))
         if self.expected is None:
             self.expected = int.from_bytes(data[:2], "little")
             self.pending.extend(data[2:])
@@ -111,6 +115,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.patcher.stop()
 
     async def test_chunks_follow_att_budget_and_preserve_utf8(self):
+        self.client.client.response_body = '200 application/json\n\n{"name":"Lumière 🌈"}\n\n'.encode()
         response = await self.client.request("post", "/json/state", '{"on":true,"bri":128}')
         self.assertEqual(response.status, 200)
         self.assertEqual(response.body, '{"name":"Lumière 🌈"}\n\n')
@@ -264,6 +269,7 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_live_and_tx_frames_interleave_independently(self):
         await self.client.subscribe_live()
+        self.client.client.requests.clear()
         self.client.client.respond = False
         task = asyncio.create_task(self.client.request("get", "/json"))
         while not self.client.client.requests:
@@ -276,6 +282,155 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
         self.client.client.callbacks[bridge.TX_UUID](None, bytearray(tx[10:]))
         self.assertEqual((await self.client.next_live())["state"]["name"], "🌈")
         self.assertEqual((await task).json(), {"ok": True})
+
+    async def test_physical_live_receiver_precedes_every_first_command(self):
+        for _ in range(2):
+            peripheral = self.client.client
+            self.assertIn(bridge.LIVE_UUID, peripheral.callbacks)
+            self.assertFalse(self.client._subscribed)
+            self.assertFalse(peripheral.writes)
+            await self.client.request("GET", "/json/info")
+            first_write = next(index for index, event in enumerate(peripheral.events) if event[0] == "write")
+            self.assertLess(peripheral.events.index(("notify", bridge.TX_UUID)), first_write)
+            self.assertLess(peripheral.events.index(("notify", bridge.LIVE_UUID)), first_write)
+            await self.client.disconnect()
+            await self.client.connect()
+
+    async def test_live_only_connect_opens_gate_with_read_only_handshake(self):
+        await self.client.disconnect()
+        original = FakePeripheral.write_gatt_char
+        snapshot = b'{"state":{"bri":81},"info":{}}'
+        async def gated_write(peripheral, characteristic, data, *, response):
+            self.assertIn(bridge.TX_UUID, peripheral.callbacks)
+            self.assertIn(bridge.LIVE_UUID, peripheral.callbacks)
+            await original(peripheral, characteristic, data, response=response)
+            if peripheral.requests and not getattr(peripheral, "initial_live_sent", False):
+                peripheral.initial_live_sent = True
+                peripheral.emit(bridge.LIVE_UUID, snapshot)
+        with patch.object(FakePeripheral, "write_gatt_char", gated_write):
+            await asyncio.wait_for(self.client.connect(live=True), 0.3)
+        self.assertEqual(self.client.client.requests, [b"GET /json/info\n\n"])
+        self.assertEqual((await self.client.next_live())["state"]["bri"], 81)
+
+    async def test_local_unsubscribe_and_reenable_preserve_partial_wire_frame(self):
+        await self.client.subscribe_live()
+        peripheral = self.client.client
+        body = b'{"state":{"bri":42},"info":{}}'
+        callback = peripheral.callbacks[bridge.LIVE_UUID]
+        callback(None, bytearray(len(body).to_bytes(2, "little") + body[:8]))
+        timer = self.client._live_timer
+        await self.client.unsubscribe_live()
+        self.assertIs(self.client._live_timer, timer)
+        self.assertEqual(bytes(self.client._live_frame.buffer), body[:8])
+        callback(None, bytearray(body[8:]))
+        self.assertTrue(self.client._live_queue.empty())
+        self.assertTrue(self.client.is_connected)
+        callback(None, bytearray(len(body).to_bytes(2, "little") + body[:11]))
+        await self.client.subscribe_live()
+        callback(None, bytearray(body[11:]))
+        self.assertEqual((await self.client.next_live())["state"]["bri"], 42)
+        self.assertEqual(peripheral.events.count(("notify", bridge.LIVE_UUID)), 1)
+        self.assertNotIn(("stop_notify", bridge.LIVE_UUID), peripheral.events)
+
+    async def test_unsubscribe_epoch_retires_waiter_before_immediate_reenable(self):
+        await self.client.subscribe_live()
+        waiting = asyncio.create_task(self.client.next_live())
+        await asyncio.sleep(0)
+        # Make resubscription synchronous so the old waiter cannot run until after it.
+        with patch.object(self.client, "refresh_capabilities", AsyncMock(return_value={})):
+            await self.client.unsubscribe_live()
+            await self.client.subscribe_live()
+        self.client.client.emit(bridge.LIVE_UUID, b'{"state":{"bri":73},"info":{}}')
+        with self.assertRaisesRegex(ConnectionError, "not subscribed"):
+            await waiting
+        self.assertEqual((await self.client.next_live())["state"]["bri"], 73)
+
+    async def test_disabled_delivery_still_validates_and_times_out_wire_frames(self):
+        self.client.client.emit(bridge.LIVE_UUID, b'{"state":true}')
+        await self.client._abort_task
+        self.assertFalse(self.client.is_connected)
+        await self.client.connect()
+        self.client.client.callbacks[bridge.LIVE_UUID](None, bytearray(b"\x20\x00{"))
+        await asyncio.sleep(0.03)
+        await self.client._abort_task
+        self.assertFalse(self.client.is_connected)
+        self.assertIsInstance(self.client._live_error, TimeoutError)
+
+    async def test_failed_live_handshake_does_not_deadlock_lifecycle_cleanup(self):
+        self.client.client.respond = False
+        self.client.timeout = 0.01
+        with self.assertRaises(TimeoutError):
+            await asyncio.wait_for(self.client.subscribe_live(), 0.3)
+        self.assertFalse(self.client.is_connected)
+        await self.client.connect()
+        self.client.client.response_body = b'200 application/json\n\n{"ble":{"protocol":9}}'
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            await asyncio.wait_for(self.client.connect(live=True), 0.3)
+        self.assertFalse(self.client.is_connected)
+
+    async def test_queued_handshake_cannot_run_on_replacement_connection(self):
+        async with self.client._request_lock:
+            task = asyncio.create_task(self.client.subscribe_live())
+            await asyncio.sleep(0)
+            await self.client.disconnect()
+            await self.client.connect()
+        with self.assertRaisesRegex(ConnectionError, "before LIVE"):
+            await task
+        self.assertTrue(self.client.is_connected)
+        self.assertFalse(self.client.client.writes)
+
+    async def test_cancelled_queued_live_handshake_does_not_close_command_owner(self):
+        async with self.client._request_lock:
+            task = asyncio.create_task(self.client.subscribe_live())
+            await asyncio.sleep(0)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        self.assertTrue(self.client.is_connected)
+
+    async def test_old_completed_handshake_cannot_change_replacement_capabilities(self):
+        original = FakePeripheral.write_gatt_char
+        old = self.client.client
+        old.response_body = b'200 application/json\n\n{"ble":{"protocol":1,"maxRequest":256}}'
+        async def reconnect_before_write_returns(peripheral, characteristic, data, *, response):
+            await original(peripheral, characteristic, data, response=response)
+            if peripheral is old and peripheral.requests:
+                await self.client.disconnect()
+                await self.client.connect()
+        with patch.object(FakePeripheral, "write_gatt_char", reconnect_before_write_returns):
+            with self.assertRaisesRegex(ConnectionError, "disconnected"):
+                await self.client.subscribe_live()
+        self.assertTrue(self.client.is_connected)
+        self.assertIsNot(self.client.client, old)
+        self.assertEqual(self.client.max_request_bytes, 4096)
+
+    async def test_retired_completed_command_reply_is_rejected_without_retry(self):
+        original = FakePeripheral.write_gatt_char
+        old = self.client.client
+        async def reconnect_before_write_returns(peripheral, characteristic, data, *, response):
+            await original(peripheral, characteristic, data, response=response)
+            if peripheral is old and peripheral.requests:
+                await self.client.disconnect()
+                await self.client.connect()
+        with patch.object(FakePeripheral, "write_gatt_char", reconnect_before_write_returns):
+            with self.assertRaisesRegex(ConnectionError, "before response delivery"):
+                await self.client.request("POST", "/json/state", '{"bri":42}')
+        self.assertEqual(old.requests, [b'POST /json/state\n\n{"bri":42}'])
+        self.assertTrue(self.client.is_connected)
+        self.assertFalse(self.client.client.requests)
+
+    async def test_invalid_live_during_notify_install_cannot_mark_connection_ready(self):
+        await self.client.disconnect()
+        original = FakePeripheral.start_notify
+        async def invalid_on_install(peripheral, uuid, callback):
+            await original(peripheral, uuid, callback)
+            if uuid == bridge.LIVE_UUID:
+                peripheral.emit(uuid, b'{"state":true}')
+        with patch.object(FakePeripheral, "start_notify", invalid_on_install):
+            with self.assertRaises(ValueError):
+                await asyncio.wait_for(self.client.connect(), 0.3)
+        await self.client._abort_task
+        self.assertFalse(self.client.is_connected)
 
     async def test_live_queue_is_bounded_and_keeps_latest(self):
         await self.client.subscribe_live()
@@ -330,6 +485,30 @@ class ClientTests(unittest.IsolatedAsyncioTestCase):
             await self.client.get_json("/json/cfg")
         self.assertEqual(result.exception.response.status, 401)
         self.assertTrue(self.client.is_connected)
+
+    async def test_queued_command_rechecks_newly_learned_request_limit_before_writing(self):
+        peripheral = self.client.client
+        peripheral.respond = False
+        peripheral.response_body = b'200 application/json\n\n{"ble":{"protocol":1,"maxRequest":256}}'
+        handshake = asyncio.create_task(self.client.subscribe_live())
+        while not peripheral.requests:
+            await asyncio.sleep(0)
+        self.assertEqual(self.client.max_request_bytes, 4096)
+        queued = asyncio.create_task(self.client.post_json("/json/state", {"name": "x" * 300}))
+        await asyncio.sleep(0)  # Queue while the capabilities request still owns the command slot.
+        writes_before_reply = len(peripheral.writes)
+        self.assertFalse(queued.done())
+        peripheral.respond = True
+        peripheral.emit(bridge.TX_UUID, peripheral.response_body)
+        await handshake
+        self.assertEqual(self.client.max_request_bytes, 256)
+        with self.assertRaisesRegex(ValueError, "bridge limit \\(256 bytes\\)"):
+            await queued
+        self.assertEqual(peripheral.requests, [b"GET /json/info\n\n"])
+        self.assertEqual(len(peripheral.writes), writes_before_reply)
+        self.assertIsNone(self.client._response)
+        self.assertTrue(self.client.is_connected)
+        self.assertEqual((await self.client.request("GET", "/json/info")).status, 200)
 
     async def test_context_manager_closes_link(self):
         other = bridge.BleApiBridgeClient("test")

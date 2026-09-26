@@ -110,8 +110,15 @@ void BleApiBridgeUsermod::loop() {
     if (!_livePushPending) _livePushDueAt = millis() + LIVE_PUSH_DEBOUNCE_MS;
     _livePushPending = true;
   }
-  if (_request.ready && !_response.active) processBleRequest();
-  if (_livePushPending && _secure && !_response.active && !_request.active && !_request.ready
+  if (_request.ready && !_response.active) {
+    const uint16_t connection = _activeConnHandle;
+    processBleRequest();
+    // Bonded CCCDs may restore before the central installs its LIVE callback.
+    // A complete authenticated RX frame proves this connection's application
+    // is ready. Its TX response still finishes before the first LIVE frame.
+    if (_bleConnected && _secure && _activeConnHandle == connection) _liveSessionReady = true;
+  }
+  if (_livePushPending && _liveSessionReady && _secure && !_response.active && !_request.active && !_request.ready
       && static_cast<int32_t>(millis() - _livePushDueAt) >= 0) {
     if (queueLiveStatePush()) _livePushPending = false;
     else _livePushDueAt = millis() + 500;

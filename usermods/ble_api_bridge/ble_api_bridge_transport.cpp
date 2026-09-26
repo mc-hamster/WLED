@@ -203,6 +203,7 @@ void BleApiBridgeUsermod::resetConnection() {
   _activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
   _indicationsEnabled = false;
   _liveUpdatesEnabled = false;
+  _liveSessionReady = false;
   _livePushPending = false;
   _nextAdvertiseAt = millis();
   clearRequestAssembly();

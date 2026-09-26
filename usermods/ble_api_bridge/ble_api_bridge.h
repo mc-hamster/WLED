@@ -92,6 +92,7 @@ private:
   bool _secure = false;
   bool _indicationsEnabled = false;
   std::atomic<bool> _liveUpdatesEnabled{false};
+  bool _liveSessionReady = false;
   bool _livePushPending = false;
   bool _restartBlePending = false;
   uint16_t _maxRequestBytes = DEFAULT_MAX_REQUEST_BYTES;
