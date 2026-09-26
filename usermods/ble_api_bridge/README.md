@@ -103,6 +103,9 @@ Supported reads: `/json`, `/json/si`, `/json/state`, `/json/info`, `/json/effect
 
 ## Reference client and regression tests
 
+See [Phase 1 hardware tests](README_PHASE1.md) for unattended regression, soak,
+configuration, and reboot suites with independent state verification and reports.
+
 ```sh
 .venv/bin/pip install -r usermods/ble_api_bridge/requirements-client.txt
 .venv/bin/python usermods/ble_api_bridge/client_example.py --scan
@@ -114,5 +117,15 @@ clang++ -std=c++17 -Wall -Wextra -Werror -fsanitize=address,undefined usermods/b
 ```
 
 On macOS, `DEVICE` is the peripheral UUID printed by scanning; pairing is automatic on the protected read. Linux/Windows may use `--pair`. The client uses Bleak 3.0.2 and serialized writes with response.
+
+**Initial macOS commissioning is a manual setup step.** Stock Bleak 3.0.2 times out a protected characteristic read after 20 seconds; increasing the overall connection timeout does not extend that inner limit. If entering the system pairing code needs more time, run:
+
+```sh
+.venv/bin/python usermods/ble_api_bridge/client_example.py --commission --address DEVICE get /json/info
+```
+
+This explicit commissioning mode selects an instance-local CoreBluetooth backend adapter through Bleak's `backend` argument. It extends only the protected TX probe to at most 90 seconds, within a 110-second total connection deadline. The firmware independently closes unauthenticated links after 120 seconds. Complete the macOS prompt using the device's code; the adapter does not enter codes, suppress prompts, or weaken authentication. It uses one private delegate method and refuses to run with a Bleak version other than the pinned 3.0.2 until that integration is revalidated. Normal API and unattended runs retain the stock backend after commissioning. A timeout disconnects and requires an explicit retry.
+
+The reusable API supports `subscribe_live()`, `next_live(timeout=...)`, `unsubscribe_live()`, `get_json()`, `post_json()`, and `refresh_capabilities()`. `connect_timeout` is an upper bound for connection/discovery/probe/subscription, not a promise that platform operations wait that long. Use `BleApiBridgeClient(..., commission=True, connect_timeout=110)` only for initial macOS setup; unattended suites should fail and report pairing loss rather than wait for human input.
 
 For reviewed changes, dependency exceptions, build results, and the physical-device acceptance matrix, see [Bluetooth review](../../docs/BLUETOOTH_REVIEW.md). Compile and simulated transport tests do not certify radio behavior or the system pairing dialog on real hardware.

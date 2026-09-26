@@ -47,6 +47,7 @@ public:
   uint16_t getId() override { return USERMOD_ID_BLE_API_BRIDGE; }
 
 private:
+  bool acceptConnection(NimBLEConnInfo& info);
   enum class EventType : uint8_t { Connected, Disconnected, Authenticated, Subscribed, Write, Confirmed };
   struct Event {
     EventType type;

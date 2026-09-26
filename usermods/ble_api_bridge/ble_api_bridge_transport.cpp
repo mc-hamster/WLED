@@ -13,13 +13,27 @@ void BleApiBridgeUsermod::enqueue(const Event& event) {
   }
 }
 
-void BleApiBridgeUsermod::onConnect(NimBLEServer* server, NimBLEConnInfo& info) {
-  if (!_acceptConnections.load() || server->getConnectedCount() > 1) {
-    server->disconnect(info.getConnHandle());
-    return;
+// NimBLE can deliver encryption/CCCD restoration before its delayed GAP CONNECT event.
+// Admit the peer on its first callback, enqueue Connected before its other events, and
+// make the later onConnect idempotent. Authentication still gates every RX/TX operation.
+bool BleApiBridgeUsermod::acceptConnection(NimBLEConnInfo& info) {
+  const uint16_t connection = info.getConnHandle();
+  if (!_acceptConnections.load()) {
+    _server->disconnect(connection);
+    return false;
   }
-  _callbackConnHandle.store(info.getConnHandle());
-  enqueue({EventType::Connected, info.getConnHandle(), 0, 0, 0, {}});
+  uint16_t expected = BLE_HS_CONN_HANDLE_NONE;
+  if (_callbackConnHandle.compare_exchange_strong(expected, connection)) {
+    enqueue({EventType::Connected, connection, 0, 0, 0, {}});
+  } else if (expected != connection) {
+    _server->disconnect(connection);
+    return false;
+  }
+  return true;
+}
+
+void BleApiBridgeUsermod::onConnect(NimBLEServer*, NimBLEConnInfo& info) {
+  acceptConnection(info);
   // Protected reads initiate pairing on iOS. Avoid racing discovery with unsolicited security requests.
 }
 
@@ -30,6 +44,7 @@ void BleApiBridgeUsermod::onDisconnect(NimBLEServer*, NimBLEConnInfo& info, int 
 }
 
 void BleApiBridgeUsermod::onAuthenticationComplete(NimBLEConnInfo& info) {
+  if (!acceptConnection(info)) return;
   const bool secure = info.isEncrypted() && info.isAuthenticated() && info.isBonded();
   enqueue({EventType::Authenticated, info.getConnHandle(), 0, secure ? 0 : 1, 0, {}});
   if (!secure) _server->disconnect(info.getConnHandle());
@@ -37,9 +52,12 @@ void BleApiBridgeUsermod::onAuthenticationComplete(NimBLEConnInfo& info) {
 
 void BleApiBridgeUsermod::onWrite(NimBLECharacteristic* characteristic, NimBLEConnInfo& info) {
   if (characteristic != _rx || !info.isEncrypted() || !info.isAuthenticated() || !info.isBonded()) {
+    DEBUG_PRINTF("[BleApiBridge] Rejected RX: encrypted=%u authenticated=%u bonded=%u\n",
+                 info.isEncrypted(), info.isAuthenticated(), info.isBonded());
     _server->disconnect(info.getConnHandle());
     return;
   }
+  if (!acceptConnection(info)) return;
   const auto value = characteristic->getValue();
   if (value.size() == 0 || value.size() > MAX_RESPONSE_CHUNK) {
     _server->disconnect(info.getConnHandle());
@@ -52,12 +70,13 @@ void BleApiBridgeUsermod::onWrite(NimBLECharacteristic* characteristic, NimBLECo
 }
 
 void BleApiBridgeUsermod::onSubscribe(NimBLECharacteristic* characteristic, NimBLEConnInfo& info, uint16_t value) {
+  if (!acceptConnection(info)) return;
   enqueue({EventType::Subscribed, info.getConnHandle(), characteristic->getHandle(), value, 0, {}});
 }
 
 void BleApiBridgeUsermod::onStatus(NimBLECharacteristic* characteristic, NimBLEConnInfo&, int status) {
   // NimBLE-Arduino 2.5.1 leaves onStatus's connInfo zero-initialized (NimBLEServer.cpp, NOTIFY_TX).
-  // This service allows one peer; capture its real handle from the ordered host connect/disconnect callbacks.
+  // This service allows one peer; capture its real handle when its first callback admits it.
   const uint16_t connection = _callbackConnHandle.load();
   if (connection != BLE_HS_CONN_HANDLE_NONE) {
     enqueue({EventType::Confirmed, connection, characteristic->getHandle(), status, 0, {}});
@@ -104,6 +123,8 @@ void BleApiBridgeUsermod::handleEvents() {
         break;
       case EventType::Write:
         if (!_secure || !_indicationsEnabled || !processWriteChunk(event.data, event.size)) {
+          DEBUG_PRINTF("[BleApiBridge] Rejected queued RX: secure=%u subscribed=%u bytes=%u active=%u ready=%u\n",
+                       _secure, _indicationsEnabled, event.size, _request.active, _request.ready);
           failConnection("Invalid or overlapping BLE request");
         }
         break;
