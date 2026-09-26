@@ -87,6 +87,7 @@ void BleApiBridgeUsermod::setup() {
   }
   preferences.end();
   _passkey.store(passkey);
+  WLED_FS.remove(TRANSFER_FILE); // discard an interrupted, never-committed upload after power loss
   applyConfig();
   _configChanged.store(false);
   _setupDone = true;
@@ -95,7 +96,8 @@ void BleApiBridgeUsermod::setup() {
 
 void BleApiBridgeUsermod::loop() {
   if (!_setupDone) return;
-  if (!_response.active && _configChanged.exchange(false)) applyConfig();
+  serviceBridgeOperations();
+  if (!_response.active && !_operationResponsePending && _configChanged.exchange(false)) applyConfig();
   handleEvents();
   if (!_enabled) { if (_acceptConnections.load()) stopBle(); return; }
   if (_restartBlePending && !_response.active) refreshBleConfiguration();
@@ -110,7 +112,7 @@ void BleApiBridgeUsermod::loop() {
     if (!_livePushPending) _livePushDueAt = millis() + LIVE_PUSH_DEBOUNCE_MS;
     _livePushPending = true;
   }
-  if (_request.ready && !_response.active) {
+  if (_request.ready && !_response.active && !_operationResponsePending) {
     const uint16_t connection = _activeConnHandle;
     processBleRequest();
     // Bonded CCCDs may restore before the central installs its LIVE callback.
@@ -118,7 +120,7 @@ void BleApiBridgeUsermod::loop() {
     // is ready. Its TX response still finishes before the first LIVE frame.
     if (_bleConnected && _secure && _activeConnHandle == connection) _liveSessionReady = true;
   }
-  if (_livePushPending && _liveSessionReady && _secure && !_response.active && !_request.active && !_request.ready
+  if (_livePushPending && _liveSessionReady && _secure && !_operationResponsePending && !_response.active && !_request.active && !_request.ready
       && static_cast<int32_t>(millis() - _livePushDueAt) >= 0) {
     if (queueLiveStatePush()) _livePushPending = false;
     else _livePushDueAt = millis() + 500;
@@ -137,6 +139,7 @@ void BleApiBridgeUsermod::addToJsonInfo(JsonObject& root) {
   Config config;
   capabilities["maxRequest"] = copyConfig(config) ? config.maxRequestBytes : DEFAULT_MAX_REQUEST_BYTES;
   capabilities["security"] = "passkey";
+  capabilities["api"] = 2;
 }
 
 void BleApiBridgeUsermod::addToJsonState(JsonObject& root) {

@@ -97,6 +97,7 @@ public:
   bool _liveSessionReady = false;
   bool _livePushPending = false;
   bool _restartBlePending = false;
+  bool _operationResponsePending = false;
   std::atomic<bool> _bleInitialized{true};
   std::atomic<bool> _bleConnected{false};
   std::atomic<bool> _configChanged{false};
@@ -129,6 +130,8 @@ public:
   std::string lastError;
 
   void applyConfig() {}
+  void serviceBridgeOperations() {}
+  void resetBridgeSession() { _operationResponsePending = false; }
   bool initBleStack() { _bleInitialized = true; return true; }
   bool startAdvertising() { return true; }
   void setLastError(const char* error) { lastError = error; }

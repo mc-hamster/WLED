@@ -293,7 +293,7 @@ void handleRemote();
 
 //set.cpp
 bool isAsterisksOnly(const char* str, byte maxLen);
-void handleSettingsSet(AsyncWebServerRequest *request, byte subPage);
+bool handleSettingsSet(AsyncWebServerRequest *request, byte subPage);
 bool handleSet(AsyncWebServerRequest *request, const String& req, bool apply=true);
 
 //wled.cpp

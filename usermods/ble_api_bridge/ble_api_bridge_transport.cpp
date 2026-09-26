@@ -198,6 +198,7 @@ bool BleApiBridgeUsermod::startAdvertising() {
 }
 
 void BleApiBridgeUsermod::resetConnection() {
+  resetBridgeSession();
   _bleConnected = false;
   _secure = false;
   _activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
@@ -237,6 +238,7 @@ void BleApiBridgeUsermod::refreshBleConfiguration() {
 
 // A live frame can finish while the next command is assembled; never discard that command as "busy".
 bool BleApiBridgeUsermod::processWriteChunk(const uint8_t* data, size_t len) {
+  if (_operationResponsePending) return false;
   return _request.append(data, len, _requestBuffer.get(), _maxRequestBytes, millis());
 }
 

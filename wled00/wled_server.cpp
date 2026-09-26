@@ -788,7 +788,7 @@ void serveSettings(AsyncWebServerRequest* request, bool post) {
       serveMessage(request, 401, FPSTR(s_accessdenied), FPSTR(s_redirecting), 123);
       return;
     }
-    if (subPage != SUBPAGE_WIFI || !(wifiLock && otaLock)) handleSettingsSet(request, subPage);
+    if ((subPage != SUBPAGE_WIFI || !(wifiLock && otaLock)) && handleSettingsSet(request, subPage)) return;
 
     char s[32];
     char s2[45] = "";

@@ -7,12 +7,12 @@ The implementation targets Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5 and NimBLE-Ardui
 ## Pair an iPhone
 
 1. Install a BLE-enabled build for the board's exact chip, flash size, and PSRAM arrangement.
-2. Open WLED over Wi-Fi. In **Settings → Usermods → BleApiBridge**, leave `enabled` on and note `pairing-code`.
+2. Obtain the device-specific pairing code. Over USB/UART, send the single ASCII character `B` at the configured serial baud rate (normally 115200); the response is `{"ble":{"pairingCode":"NNNNNN"}}`. Alternatively, open **Settings → Usermods → BleApiBridge** over Wi-Fi and note `pairing-code`. Keep Bluetooth enabled.
 3. In the forked iOS app, add a device, choose **Bluetooth**, and select the nearby WLED device. A blank firmware `device-name` becomes `WLED-` followed by a unique MAC suffix.
 4. Tap **Add**, accept the iOS system pairing prompt, and enter the device's six-digit code. The app reads a protected characteristic before starting its command timeout, allowing time to enter the code.
-5. Use the native power, brightness, and main-segment color controls. The app subscribes to state updates and reconnects while active. A brief background transition is tolerated; longer background periods disconnect to release the device.
+5. Use the native lighting, effect, palette, scene and playlist controls, or open the complete offline device workspace for settings and tools. The app subscribes to state updates and reconnects while active. A brief background transition is tolerated; longer background periods disconnect to release the device.
 
-Pairing and bond storage belong to iOS. No code is entered into or saved by the app. Initial provisioning currently requires Wi-Fi access to read the code; the firmware has no physical display. This is not a Wi-Fi provisioning service.
+Pairing and bond storage belong to iOS. No code is entered into or saved by the app. Initial provisioning can use the physical USB/UART pairing-code query without joining Wi-Fi. Keep the code with the device or print a device label. The query requires the normal WLED serial RX/TX pins to be available; no code is emitted automatically or broadcast over Bluetooth. Wi-Fi credentials can subsequently be configured from the offline Bluetooth settings interface.
 
 The code is generated once per installation and persisted in NVS. It is **no longer universally `123456`**. Changing it to another number from 100000–999999 forgets firmware-side bonds and disconnects connected clients. If iOS reports stale pairing information, forget this WLED device in **Settings → Bluetooth**, then pair again. A failed or cancelled pairing attempt requires an explicit retry; the app avoids repeatedly opening the system prompt.
 
@@ -62,7 +62,7 @@ Classic ESP32 profiles rebuild the pinned Arduino 3.3.12 / IDF 5.5.5 SDK with a 
 
 The bridge requires encryption, authenticated pairing, bonding, and LE Secure Connections. `MYNEWT_VAL_BLE_SM_SC_ONLY=1` is mandatory in the supplied profiles; the build fails without it. Numeric comparison is never silently accepted. Pairing remains discoverable while enabled, but a new client must know the device code. WLED's existing local-network trust model still applies to its Wi-Fi settings page.
 
-A configured WLED settings PIN is independently checked on every `POST /json/cfg`; another HTTP client's global unlock does not authorize a BLE request. Include `"pin":"1234"` in that request's JSON when required. Protected configuration reads return 401 and should use WLED's PIN-protected Wi-Fi settings page. State control requires the BLE bond but does not require the settings PIN.
+A configured WLED settings PIN is independent of Bluetooth pairing. Authenticate using `POST /ble/auth` with `{"pin":"1234"}` before accessing configuration, settings forms, or privileged files. Authorization belongs only to the current encrypted connection, expires on disconnect or PIN change, and never borrows another HTTP client's global unlock. `{"lock":true}` revokes it. Incorrect attempts are throttled across reconnects. The older request-local `pin` field remains supported for `POST /json/cfg`. Lighting state and preset controls require the Bluetooth bond but do not require the settings PIN.
 
 ## GATT contract (protocol 1)
 
@@ -101,12 +101,45 @@ Requests are bounded by the configured maximum (at most 4096 bytes); response/li
 
 An unauthenticated connection is closed after 120 seconds so an abandoned pairing does not hold the device indefinitely. The iOS connection/pairing deadline is 90 seconds; command idle deadline is 30 seconds, renewed by write acknowledgements and response chunks. Live updates are coalesced at 150 ms and commands take priority. `/json/info` exposes `ble.protocol`, `ble.maxRequest`, and `ble.security` for client capability detection.
 
-Supported reads: `/json`, `/json/si`, `/json/state`, `/json/info`, `/json/effects`, `/json/fxdata`, `/json/pins`, `/json/cfg`. Supported writes: `/json`, `/json/state`, `/json/cfg`. These call WLED's existing serializers/deserializers; the bridge does not serve HTML, presets files, arbitrary HTTP endpoints, or firmware uploads.
+API version 2 adds complete local-control adapters while retaining protocol-1 frames and UUIDs. Reads include `/json`, `/json/si`, `/json/state`, `/json/info`, `/json/effects`, `/json/fxdata`, `/json/palettes` (or `/json/pal`), `/json/palx?page=N`, `/json/pins`, `/json/cfg`, `/json/net`, `/json/nodes`, and `/json/live`. `/json` includes effect and palette catalogs; `/json/si` and LIVE indications contain state/info only. Effect metadata matches HTTP's strings after `@`.
+
+State/config writes accept `/json`, `/json/si`, `/json/state`, and `/json/cfg`. Settings scripts are available at `/settings/s.js?p=N`; URL-encoded POST forms use `/settings/{wifi,leds,ui,sync,time,sec,dmx,um,2D}`. Both transports call the same settings mutation routine, including ordered duplicate usermod fields. Unsupported compiled-out pages return an error. `/reset` reboots after confirming its response. Legacy `/win&...` commands are accepted. The iOS app supplies bundled HTML/CSS/JavaScript offline and routes requests through these adapters; firmware does not need to transmit its entire web bundle.
+
+### API version 2 transfer contract
+
+`GET /ble/capabilities` returns `version:2`, `protocol:1`, `maxFrameSize`, `maxChunk`, `maxPathBytes`, `maxRequestSize`, `maxFileSize`, `features`, `authorized`, and `pinRequired`. Obey these negotiated limits, including when the user has lowered the request limit below 4096. `GET /ble/auth` returns the authorization state. No secrets belong in URLs.
+
+All following operations are JSON POST requests. Transfer IDs are opaque eight-character hexadecimal strings, scoped to the current connection. Only one upload or staged request is active at a time; serialize each complete begin/write/commit sequence. Reads can interleave between files.
+
+| Endpoint/operation | Request fields | Response |
+| --- | --- | --- |
+| `/ble/fs`, `list` | `cursor` (default 0), `limit` (1–16) | `files:[{name,size}]`, `next` cursor or null |
+| `/ble/fs`, `read` | `path`, `offset`, `length` up to `maxChunk`, `revision` for nonzero offsets | `path,size,offset,next,eof,revision,data` (base64) |
+| `/ble/fs`, `begin` | `path,size,sha256` | `id,maxChunk,next:0` |
+| `/ble/request`, `begin` | `method:"POST",path,contentType,size,sha256` | `id,maxChunk,next:0` |
+| Either endpoint, `write` | `id,offset,data` (canonical base64) | `id,next` |
+| Either endpoint, `commit` | `id` | File: `success,saved,size,sha256,reboot`; request: actual route's response |
+| Either endpoint, `abort` | `id` | `success:true` |
+| `/ble/fs`, `delete` | `path` | `success:true` |
+
+`sha256` and read `revision` are lowercase SHA-256 hex strings. Writes must have sequential offsets and exact total length; malformed base64, bad checksums, and invalid paths fail before commit. A temporary file is atomically renamed only after verification. Disconnect, timeout (60 seconds without transfer activity), and reboot remove incomplete uploads. A file replacement requires room for both the old and new files; low-space failure preserves the original.
+
+Read clients **must hash the complete reconstructed file and compare it with the returned revision**. Firmware hashes ordinary files at the start and end; changes produce 409 when detected. The aggregate client hash additionally catches interleaved edits. Restart changed reads from offset zero. Configuration backup reads serialize the current public configuration (passwords remain excluded) and reject a changed revision between chunks. Secret files (`wsec` in the name), noncanonical paths, and bridge staging files are excluded. Preset/palette reads have the same public visibility as their HTTP equivalents; other file operations honor the settings PIN.
+
+Staged requests accept only the supported JSON state/config and settings-form POST routes, up to 32768 bytes. JSON still respects WLED's configured JSON-memory capacity. Reserved `cfg.json` restores require a configuration object with revision, identity and LED hardware fields; preset files require an object root. All JSON uploads must parse. Custom palettes reload after commit/delete, and preset changes invalidate the UI cache.
+
+`POST /ble/presets` with `{"op":"rename","id":1,"name":"Evening"}` edits the stored preset/playlist name without applying it. Preset IDs are 1–250 and names are at most 32 UTF-8 bytes. Successful mutations return a persistence receipt. Settings, configuration, and preset-save replies wait for core persistence and return `saved:true` only after a checked write. `GET /ble/status` exposes `config` and `presets` objects (`pending,generation,success`) plus `rebootPending`. Generations distinguish a completed write from an older successful operation. Reboot and Bluetooth reconfiguration wait until the last response indication is confirmed; failed saves suppress a requested reboot. A receipt includes `reboot`, `reconnect`, and `bluetoothEnabled` when a configuration change affects the link; finish the UI operation using that receipt before trying another command. A disconnected pending save still checks its result, but never delivers its old receipt to a replacement connection.
+
+`POST /ble/ddp` with `{"data":"<base64>"}` accepts the same 0x02-prefixed RGB DDP binary packet as WLED's WebSocket endpoint, up to 1428 decoded bytes and the negotiated request-frame limit. Send sequentially with back-pressure; Bluetooth pixel throughput is lower than Wi-Fi. `/json/live` samples at most 256 pixels as six-character RGB hex strings with `n` sampling step and optional matrix `w,h`. Poll only while the preview is visible. Real-time network integrations continue to need their underlying network even though their configuration interface works over Bluetooth.
 
 ## Reference client and regression tests
 
 See [Phase 1 hardware tests](README_PHASE1.md) for unattended regression, soak,
 configuration, and reboot suites with independent state verification and reports.
+
+For the API 2 parity smoke test with Wi-Fi off, run `parity_hil.py --address DEVICE` after pairing. Add `--ask-pin` when a settings PIN is configured. This checks catalogs, live pixels, settings scripts, a large staged state request, and a uniquely named temporary file's chunked write/read/checksum/abort/delete paths. It also verifies that rejected replacements preserve the original bytes. Reports contain outcomes, never PINs or configuration contents. Disconnect the iPhone app first: the reference tool and phone cannot share the radio connection. Run the iPhone hardware suite separately. The smoke test does not replace settings/reboot/power-loss and low-heap testing on real hardware.
+
+For reversible persistence checks on an exclusively controlled fixture, use `parity_persistence_hil.py --address DEVICE --expected-mac USB_VERIFIED_MAC --output NEW_PRIVATE_DIRECTORY`. It backs up configuration, runtime state and the original preset bytes before mutation; tests scene save/rename/delete and playlist file storage without starting playback; saves a temporary description through the complete UI form; and checks disconnect cleanup. Add `--allow-reboot` for durable settings/restoration checks with measured uptime-reset evidence and `--exercise-pin` to test a temporary settings PIN only when the initial PIN is blank. A known existing PIN can be supplied through the environment variable named by `--settings-pin-env`; an unknown PIN stops the run without replacing it. Recovery credentials are journaled privately before mutation, cleanup is separately bounded and shielded from cancellation, and failed cases stay failed even after successful restoration. Final restoration checks include the original runtime UDP send/receive groups. Keep the backup directory until final restoration is verified. The tool uses only BLE and does not replace the independent USB backup or radio/power-loss acceptance tests.
 
 ```sh
 .venv/bin/pip install -r usermods/ble_api_bridge/requirements-client.txt

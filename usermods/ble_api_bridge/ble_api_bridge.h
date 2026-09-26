@@ -1,6 +1,7 @@
 #pragma once
 #include "wled.h"
 #include "ble_bridge_protocol.h"
+#include "ble_bridge_storage_protocol.h"
 
 #if !defined(ARDUINO_ARCH_ESP32) || defined(CONFIG_IDF_TARGET_ESP32S2) || defined(CONFIG_IDF_TARGET_ESP32P4)
 #error "ble_api_bridge requires an ESP32 with an integrated Bluetooth LE radio (ESP32, C3, S3, C6)."
@@ -45,6 +46,7 @@ public:
   bool readFromConfig(JsonObject& root) override;
   void onStateChange(uint8_t mode) override;
   uint16_t getId() override { return USERMOD_ID_BLE_API_BRIDGE; }
+  uint32_t pairingCode() const { return _passkey.load(); }
 
 private:
   bool acceptConnection(NimBLEConnInfo& info);
@@ -95,6 +97,20 @@ private:
   bool _liveSessionReady = false;
   bool _livePushPending = false;
   bool _restartBlePending = false;
+  bool _rebootAfterResponse = false;
+  bool _operationResponsePending = false;
+  bool _replyConfig = false, _replyPresets = false, _replyVerbose = false, _replyAttached = false;
+  uint32_t _configBefore = 0, _presetsBefore = 0;
+  char _authorizedPIN[5] = {};
+  uint32_t _lastPINFailure = 0;
+  bool _hasPINFailure = false;
+  struct Transfer {
+    String id, path, digest, contentType;
+    File file;
+    size_t size = 0, offset = 0;
+    uint32_t touched = 0;
+    bool request = false;
+  } _transfer;
   uint16_t _maxRequestBytes = DEFAULT_MAX_REQUEST_BYTES;
   uint16_t _activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
   uint32_t _livePushDueAt = 0;
@@ -133,10 +149,30 @@ private:
   bool queueErrorResponse(uint16_t status, const String& message);
   bool queueLiveStatePush();
   bool buildJsonBody(const String& path, String& body);
+  bool settingsAuthorized() const;
+  bool configurationWillDisconnect(bool& enabled);
+  bool dispatchBridge(const String& path, const String& body);
+  bool dispatchTransfer(const String& body, bool request);
+  bool dispatchSettings(const String& path, const String& body, File* staged = nullptr);
+  bool dispatchSettingsScript(const String& path);
+  bool dispatchLegacy(const String& path);
+  bool dispatchFileRead(const String& body);
+  bool dispatchPresets(const String& body);
+  bool dispatchDDP(const String& body);
+  bool queueCapabilities();
+  bool queueAuthState();
+  bool queueDocument(const JsonDocument& document, uint16_t status = 200);
+  void cancelTransfer();
+  void resetBridgeSession();
+  void serviceBridgeOperations();
+  void deferReboot();
+  bool queuePersistenceReply(bool configuration, bool presets, bool verbose = false);
+  size_t transferChunkSize() const;
   String normalizePath(const String& rawPath) const;
   bool dispatchGet(const String& rawPath);
   bool dispatchPostJsonState(const String& bodyText);
   bool dispatchPostJsonConfig(const String& bodyText);
+  bool dispatchJson(const String& bodyText, Stream* staged, bool configuration);
   bool dispatchPost(const String& rawPath, const String& bodyText);
   bool processRequestText(const String& requestText);
   void processBleRequest();
