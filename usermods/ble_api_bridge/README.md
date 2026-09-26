@@ -2,7 +2,7 @@
 
 This usermod exposes WLED's JSON control API over authenticated Bluetooth LE. Use it with the `ble` branch of [mc-hamster/WLED-iOS](https://github.com/mc-hamster/WLED-iOS/tree/ble). Wi-Fi remains available. The firmware supports one connected Bluetooth client at a time.
 
-The implementation targets Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5 and NimBLE-Arduino 2.5.1. ESP8266, ESP32-S2, and ESP32-P4 do not have the required integrated BLE radio. ESP32, C3, and S3 build profiles are supplied; other radio-capable chips need their own validation. Do not combine this bridge with another usermod that owns the NimBLE device/server.
+The implementation targets Arduino-ESP32 3.3.12 / ESP-IDF 5.5.5 and NimBLE-Arduino 2.5.1. ESP8266, ESP32-S2, and ESP32-P4 do not have the required integrated BLE radio. The supported BLE families are classic ESP32 and ESP32-S3. ESP32-C3 is excluded from this fork's BLE support; other radio-capable chips need their own validation. Do not combine this bridge with another usermod that owns the NimBLE device/server.
 
 ## Pair an iPhone
 
@@ -33,20 +33,23 @@ cp usermods/ble_api_bridge/platformio_override.ini.sample platformio_override.in
 
 If a local override already exists, merge the sample into it instead of overwriting it. Ordinary upstream targets do not include this usermod.
 
-| Environment | Hardware | Features omitted for capacity |
+The BLE profiles retain their base target's WLED features, libraries, and usermods (including AudioReactive). **OTA is intentionally disabled; firmware updates require USB.** No other WLED features are removed: 2D/matrix effects, GIF, DMX input, IR, Alexa, Hue sync, ESP-NOW, and the remaining base integrations stay enabled. ESP32-C3 is excluded from support.
+
+| Environment | Base hardware | USB-only partition layout |
 | --- | --- | --- |
-| `esp32dev_ble_api_bridge` | Classic ESP32, 4 MB flash | 2D effects, GIF, DMX input, IR, Alexa, Hue sync, ESP-NOW |
-| `esp32c3dev_ble_api_bridge` | ESP32-C3, 4 MB flash | Same compact strip profile |
-| `esp32dev_8MB_ble_api_bridge` | Classic ESP32, 8 MB flash, DIO | DMX input, to fit instruction RAM |
-| `esp32s3dev_ble_api_bridge` | ESP32-S3, 8 MB flash, octal PSRAM (`qio_opi`) | No additional core integrations removed |
+| `esp32dev_ble_api_bridge` | Classic ESP32, 4 MB flash | One 3 MiB app; 960 KiB filesystem |
+| `esp32dev_8MB_ble_api_bridge` | Classic ESP32, 8 MB flash | One 4 MiB app; 3,968 KiB filesystem; 64 KiB coredump |
+| `esp32s3dev_ble_api_bridge` | ESP32-S3, 8 MB flash, octal PSRAM (`qio_opi`) | One 4 MiB app; 3,968 KiB filesystem; 64 KiB coredump |
 
-All profiles retain Wi-Fi, Bluetooth, OTA over Wi-Fi, and normal 1D effects. They select only the BLE usermod; AudioReactive and other optional usermods are not included. An S3 board with a different PSRAM type needs a matching base environment. More flash does not increase classic ESP32 instruction RAM.
+See the [review's build results](../../docs/BLUETOOTH_REVIEW.md#verification-performed) for the validation status of each target. Earlier compact builds that removed features or reduced storage have been retired. Do not distribute those images. An S3 board with a different PSRAM type needs a matching base environment.
 
-The 4 MB profiles use `tools/WLED_ESP32_4MB_256KB_FS.csv`: two 1,900,544-byte app slots and a 256 KB filesystem. The standard `esp32dev` regression target also uses this larger app layout with the newer platform. The 8 MB profiles use two 2 MB app slots.
+The two OTA slots are replaced by one factory application partition. NVS and filesystem offsets and capacities stay the same as upstream; 8 MB boards also keep the coredump partition. Wi-Fi configuration, backup/restore, filesystem access, and the full WLED web interface remain available. Neither Wi-Fi OTA nor BLE OTA is available. The firmware reports this through `info.opt` bit 0; the web UI hides its update section and the app shows USB update guidance. Stock release updates remain blocked for recognized BLE firmware.
 
-**Back up settings and presets before changing partition layouts.** Install a changed layout over USB with the generated bootloader, partition table, and application/factory image. An application-only OTA upload cannot migrate partitions and may exceed the old slot or leave the filesystem at the wrong offset. Use ordinary Wi-Fi OTA only after the installed layout matches. BLE OTA and filesystem transfer are not implemented. The app suppresses stock release updates for recognized BLE firmware because those images would remove Bluetooth support.
+Before changing partition layouts, back up settings and presets through Wi-Fi. Building and then running `.venv/bin/pio run -e YOUR_ENVIRONMENT -t upload` with the board connected uses the matching bootloader, partition table, and application over USB. If distributing a binary instead, use the factory image for the initial layout transition. Install the matching **factory image over USB** to update the bootloader, partition table, and application together; an application-only image cannot change the partition table. Factory images contain padding across NVS and can erase stored Wi-Fi credentials, the pairing code, and bonds even though the filesystem offset is preserved. Restore configuration/presets if necessary and re-pair after an NVS reset. Keep passwords separately: WLED's configuration backup does not include them.
 
-Release filenames contain `_BLE`; per-environment binaries and factory images are also available in the PlatformIO build directory. Do not flash an 8 MB image onto a 4 MB board.
+Subsequent updates with the **same** layout can use the application binary at `0x10000` over USB, preserving data partitions when no full-chip erase is requested. The generated `firmware.factory.bin` is flashed at `0x0`; `firmware.bin` is the application only. Release filenames contain `_BLE_NOOTA`. Do not flash an 8 MB image onto a 4 MB board. The fork's ordinary `esp32dev` regression target also uses the 3 MiB USB-only layout, without the BLE usermod.
+
+Classic ESP32 profiles rebuild the pinned Arduino 3.3.12 / IDF 5.5.5 SDK with a BLE-only controller and without C++ exceptions/RTTI, which WLED does not use. This leaves instruction RAM for all the WLED integrations. The first build takes longer because it compiles the SDK; later builds use its cache. Keep `pio-scripts/ble_sdk.py` with the sample: it makes SDK cache selection account for board settings and resolves the release-name override before SDK compilation. Do not build different SDK configurations concurrently against the same PlatformIO package directory.
 
 ## Settings and security
 

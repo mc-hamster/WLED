@@ -1,6 +1,6 @@
 # iOS ↔ WLED Bluetooth review
 
-Reviewed 2026-09-24 on the `ble` branches of `mc-hamster/WLED` and `mc-hamster/WLED-iOS`. This work is maintained as a fork; no pull request, push, device flash, or deployment was performed.
+Reviewed 2026-09-25 on the `ble` branches of `mc-hamster/WLED` and `mc-hamster/WLED-iOS`. This work is maintained as a fork; no pull request, push, device flash, or deployment was performed.
 
 ## Baseline and conclusion
 
@@ -24,7 +24,7 @@ The app and firmware now implement the same service, security handshake, byte fr
 | P1 | Disconnects could leave the app showing connected; stale asynchronous work could revive a destroyed client; writes could overlap. | Immediate disconnect propagation, generation-guarded tasks, exponential reconnect, independent state-change coalescing, and one serialized command stream. Pairing/permission errors wait for explicit user action. |
 | P1 | BLE metadata was added directly to the already-shipped Core Data v2 model, endangering upstream store migration. | Restored upstream v2 and made the BLE schema v3; migration flags are set before loading. An actual v2 SQLite store migrates with names, MACs, and Wi-Fi addresses preserved. Former BLE v2's schema remains represented by v3. |
 | P1 | An unrelated HTTP client's global `correctPIN` could authorize a BLE configuration write. | `/json/cfg` writes independently validate the PIN in that request. Protected reads require the PIN-protected Wi-Fi settings path. No global unlock is borrowed or changed. |
-| P1 | Larger dependencies overflowed 4 MB flash slots; classic ESP32's complete integration set overflowed instruction RAM even with 8 MB flash. | Explicit compact ESP32/C3 profiles, larger 4 MB slots, an 8 MB ESP32 profile without DMX input, and an S3 8 MB octal-PSRAM profile. All profile differences and partition migration requirements are documented. |
+| P1 | The move to the newer SDK exceeded the old OTA slots; the earlier workaround removed WLED features and filesystem capacity. | That workaround is retired. At the fork owner's explicit direction, all three supported BLE profiles use a single factory app partition and disable OTA. Every other base integration and the original data-partition capacity are preserved. C3 is excluded. Classic ESP32 rebuilds the current SDK for a BLE-only controller to retain DMX and AudioReactive within instruction RAM. |
 | P2 | BLE device UUIDs were stored as hostnames; mDNS address changes could unnecessarily restart BLE connections. | UUIDs are excluded from Wi-Fi addresses; BLE connection signatures depend on the peripheral identity. Existing Wi-Fi addresses survive BLE registration. |
 | P2 | Discovery lost scan intent while the radio initialized; early construction could prompt for permissions unexpectedly; pairing screens showed ineffective passkey controls. | Lazy central creation, remembered scan intent, explicit permission/radio states, clearer nearby names/signal labels, cancellable onboarding, and system-pairing guidance. Manual visual verification remains pending. |
 | P2 | Bluetooth detail view did not expose useful native LED controls. | Native power, brightness, and main-segment RGB control preserving the white channel; authoritative state refresh after each write and optional live updates. Offline controls are disabled and reconnect/errors are visible. |
@@ -41,10 +41,10 @@ Versions were checked against package registries and upstream release/branch met
 | [pioarduino ESP32 platform](https://github.com/pioarduino/platform-espressif32/releases/tag/55.03.312-1) | 55.03.312-1 | Arduino 3.3.12 / IDF 5.5.5, replacing the older Tasmota baseline |
 | [NimBLE-Arduino](https://github.com/h2zero/NimBLE-Arduino/releases/tag/2.5.1) | 2.5.1 | Explicit bridge dependency; API and acknowledgement callback source reviewed |
 | [AsyncTCP](https://github.com/ESP32Async/AsyncTCP/releases) | 3.5.0 | Updated |
-| [AnimatedGIF](https://github.com/bitbank2/AnimatedGIF/releases) | 2.2.0 | Updated; enabled in the larger profiles |
+| [AnimatedGIF](https://github.com/bitbank2/AnimatedGIF/releases) | 2.2.0 | Updated; enabled in every supported BLE profile |
 | [ESPAsyncWebServer WLED fork](https://github.com/Aircoookie/ESPAsyncWebServer/commit/dbb7c33898902de66bb165060767f14ae4fb1cca) | 2.4.2, `dbb7c338…` | Updated to this fork's tip; retains WLED-specific APIs |
 | [NeoPixelBus CORE3](https://github.com/Makuna/NeoPixelBus/tree/CORE3) | 2.9.0 branch, `76afe832…` | Already at the compatible branch tip; kept exact pin |
-| [esp_dmx IDF 5 fork](https://github.com/netmindz/esp_dmx/tree/esp-idf-v5-fixes) | 4.1.0, `ed12a290…` | Already at the required fork tip; enabled in S3 profile |
+| [esp_dmx IDF 5 fork](https://github.com/netmindz/esp_dmx/tree/esp-idf-v5-fixes) | 4.1.0, `ed12a290…` | Already at the required fork tip; enabled in every supported BLE profile |
 | [GifDecoder fork](https://github.com/Aircoookie/GifDecoder) | 1.1.0, `bc3af189…` | Already at fork tip |
 | IRremoteESP8266 / AsyncMqttClient | 2.9.0 / 0.9.0 | Latest releases already selected |
 | [Swift Collections](https://github.com/apple/swift-collections/releases) | 1.7.0 | Updated minimum and resolved pin |
@@ -67,20 +67,41 @@ Compatibility exceptions are intentional and visible:
 - WLED web build: `npm ci`, `npm run build`, and all 16 Node tests passed; no generated headers were committed.
 - Firmware frame assembly: 24,576 native round trips covering every request size 1–4096 at packet budgets 3/20/65/180/182/244; invalid lengths, overflow canaries, overlapping requests, and `millis()` rollover. Clang AddressSanitizer and UndefinedBehaviorSanitizer passed.
 - Python reference client: 8 tests passed for strict framing, UTF-8, concurrent request serialization, ATT budgeting, response-before-write completion, cancellation, timeout/reconnect, malformed packets, required pairing probe, and firmware UUID agreement.
-- iOS: 41 tests passed (46 executions including parameterized ATT cases) on the iOS 27 Simulator using Xcode 27. Tests cover the above session/client races, live/response separation, database migration and legacy secret cleanup, plus upstream regression tests. The deployment target remains iOS 16; older physical OS versions were not exercised.
+- iOS: 44 tests passed (52 executions including parameterized ATT and OTA-capability cases) on the iOS 27 Simulator using Xcode 27. Tests cover the above session/client races, live/response separation, database migration and legacy secret cleanup, plus upstream regression tests. The deployment target remains iOS 16; older physical OS versions were not exercised.
 - Unsigned generic iPhone build passed. This checks compilation/linkage for devices; it does not install or exercise Core Bluetooth radio traffic.
 - Service/RX/TX/LIVE UUIDs were compared across Swift, C++, and Python and match exactly, ignoring UUID letter case.
-- Final firmware builds passed for all five targets below. RAM figures describe static allocation, not runtime free heap.
+- Profile regression tests require the inherited WLED feature flags, libraries, and usermods, with OTA as the sole allowed feature removal. They check exact factory-app/NVS/filesystem/coredump layouts, reject the earlier feature cuts and reduced storage, prevent ArduinoOTA from re-enabling updates, and exclude the C3 profile.
+- Firmware build results for the USB-only profiles are recorded below. Static RAM is not a runtime heap measurement.
 
-| Environment | Result | App flash / slot bytes | Spare app bytes | Static RAM bytes |
-| --- | --- | --- | --- | --- |
-| `esp32dev` | Passed | 1,797,837 / 1,900,544 | 102,707 | 93,632 |
-| `esp32dev_ble_api_bridge` | Passed | 1,821,121 / 1,900,544 | 79,423 | 99,860 |
-| `esp32c3dev_ble_api_bridge` | Passed | 1,847,253 / 1,900,544 | 53,291 | 84,952 |
-| `esp32s3dev_ble_api_bridge` | Passed | 1,905,166 / 2,097,152 | 191,986 | 66,476 |
-| `esp32dev_8MB_ble_api_bridge` | Passed | 1,971,597 / 2,097,152 | 125,555 | 102,252 |
+| Environment | Application binary / partition bytes | Spare app bytes | Static DRAM bytes |
+| --- | --- | --- | --- |
+| `esp32dev_ble_api_bridge` | 1,906,640 / 3,145,728 | 1,239,088 | 101,468 |
+| `esp32dev_8MB_ble_api_bridge` | 1,878,816 / 4,194,304 | 2,315,488 | 101,060 |
+| `esp32s3dev_ble_api_bridge` | 1,991,072 / 4,194,304 | 2,203,232 | 66,939 |
+| `esp32dev` | 1,834,416 / 3,145,728 | 1,311,312 | 93,598 |
+| `esp32dev_debug` | 1,857,632 / 3,145,728 | 1,288,096 | 93,678 |
 
-The compact profiles retain roughly 53–79 KB of app-slot headroom. Runtime heap and instruction-RAM pressure still require the hardware soak test; an 8 MB flash chip does not change classic ESP32 RAM capacity.
+All five builds passed. Sizes use the actual application binary, including its headers and padding. The generated binary partition tables were parsed and verified, image checksums/digests passed, and linked symbols confirmed DMX input, GIF, AudioReactive, IR, Alexa, Hue sync, 2D effects and ESP-NOW; the three BLE targets also contain the bridge. Firmware-upload and ArduinoOTA entry points are absent. Classic BLE instruction RAM usage is 104,599 bytes (4 MB) and 102,207 bytes (8 MB), within the 131,072-byte region. Runtime free heap and radio behavior remain hardware-test items.
+
+## Why the firmware grew and why these builds use USB
+
+A controlled rebuild used the current WLED/BLE source and updated application libraries with the previous upstream Tasmota platform (`2026.05.50`, Arduino 3.3.8 / IDF 5.5.4). It retained AudioReactive, GIF/2D, DMX input, IR, Alexa, Hue sync and ESP-NOW:
+
+| Controlled build | Actual application binary bytes |
+| --- | ---: |
+| Full WLED, previous upstream platform, no BLE | 1,338,384 |
+| Full WLED plus BLE, same previous platform | 1,515,488 |
+| Increment attributable to BLE in that comparison | 177,104 |
+
+The full BLE control build fits the original 1,572,864-byte OTA slot with 57,376 bytes left. The switch to the newer Arduino 3.3.12 / IDF 5.5.5 platform and its larger default SDK configuration was a major cause of the size regression; it was incorrect to present the earlier feature cuts as unavoidable Bluetooth overhead. This experiment does not isolate every individual SDK/library contribution.
+
+The owner chose to retain the current SDK and remove OTA. The 4 MB profiles now have a 3,145,728-byte factory application partition and the original 983,040-byte filesystem. The 8 MB profiles have a 4,194,304-byte factory application partition and the original 4,063,232-byte filesystem plus 65,536-byte coredump. NVS remains at `0x9000`, size `0x5000`. Only the application/OTA layout changes. The ordinary `esp32dev` regression target also uses USB updates.
+
+The stock current SDK also exceeded classic ESP32 instruction RAM with all integrations and BLE enabled. The classic BLE profiles rebuild that same SDK with a BLE-only controller and C++ exceptions/RTTI disabled; WLED does not use either C++ feature. SDK components are retained. All USB profiles explicitly name the factory partition for PlatformIO size checks; the platform otherwise looks only for an OTA slot and can report the entire flash capacity as the application limit. The helper script prevents cache reuse across incompatible board configurations and resolves duplicate release-name definitions during SDK compilation. S3 uses the stock SDK. No WLED integrations are removed for RAM savings.
+
+The firmware clears the standard OTA capability bit, hides the web update section, and rejects `/update`; ArduinoOTA is disabled. The iOS app honors that bit, hides its release channel/update controls, explains USB updates, and rechecks eligibility before download/upload, including stale update screens. A matching BLE capability still blocks generic stock firmware updates independently of the OTA bit.
+
+**Install the new layout over USB after backing up configuration/presets.** Factory-image padding can overwrite NVS, requiring Wi-Fi credentials and Bluetooth pairing to be set up again. Keeping the filesystem offset does not guarantee preservation under an erase-all flash operation. Subsequent matching application-only images can be written at `0x10000` over USB without changing the data partitions. See the [installation instructions](../usermods/ble_api_bridge/README.md#build-profiles-and-installation).
 
 ## Physical-device acceptance matrix (pending)
 
@@ -101,10 +122,10 @@ Record chip, board, flash/PSRAM size, firmware SHA, app SHA, iOS version, free/m
 | Runtime enable/disable / name change / long UTF-8 name | Advertising follows configuration; disable drops connection; re-enable needs no reboot. |
 | Settings PIN + another Wi-Fi client's unlocked session | Wrong/missing BLE PIN still returns 401; correct PIN authorizes only the submitted configuration write. |
 | Wi-Fi load + BLE + active effects, sustained soak | No watchdog/reset/heap degradation; acceptable control latency and LED output. S3 test should include PSRAM, DMX/GIF and selected integrations. |
-| USB partition transition, backup/restore, subsequent Wi-Fi OTA | Correct app slots and filesystem; settings/presets restored; OTA installs another matching BLE image. |
+| USB partition transition, backup/restore, subsequent USB update | One factory app; original filesystem capacity; configuration/presets restored; credentials and pairing re-established if NVS was overwritten. Matching application-only USB updates preserve data. Wi-Fi `/update` rejects uploads and no wireless update is offered by the app/web UI. |
 | Small screen / large Dynamic Type / VoiceOver / light and dark appearance | Pairing instructions, errors, action buttons, and native controls remain readable and operable. |
 
-Native BLE controls currently cover power, brightness, and the main segment's RGB color while preserving its white component. Preset/effect editors, filesystem/configuration pages, LED streaming, and firmware updates are not native BLE app features; use Wi-Fi for those interfaces. JSON clients can invoke the supported bridge routes directly. Live updates are intended for foreground use, not real-time pixel streaming.
+Native BLE controls currently cover power, brightness, and the main segment's RGB color while preserving its white component. Preset/effect editors, filesystem/configuration pages, and LED streaming are not native BLE app features; use Wi-Fi for those interfaces. Firmware updates require USB in the supported fork profiles. JSON clients can invoke the supported bridge routes directly. Live updates are intended for foreground use, not real-time pixel streaming.
 
 ## Local environment notes
 
